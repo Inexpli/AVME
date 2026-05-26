@@ -10,6 +10,8 @@ class Supplier(Base):
     __tablename__ = "suppliers"
 
     id = Column(Integer, primary_key=True, index=True)
+    sap_id = Column(String, nullable=True, index=True, unique=True)
+    dataverse_id = Column(String, nullable=True, index=True, unique=True)
     name = Column(String, nullable=False)
     country = Column(String, nullable=False)
     category = Column(String, nullable=False)

@@ -1,16 +1,29 @@
+import mimetypes
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, Request
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from . import ai, auth, models, schemas, seed
+from . import (
+    ai,
+    auth,
+    azure_search,
+    dataverse,
+    document_processing,
+    models,
+    power_platform,
+    sap,
+    schemas,
+    seed,
+    storage,
+)
 from .database import SessionLocal, engine
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -77,9 +90,24 @@ def _provider() -> str:
     return provider
 
 
+def _ensure_supplier_external_columns() -> None:
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        columns = conn.execute(text("PRAGMA table_info(suppliers)")).fetchall()
+        names = {row[1] for row in columns}
+        if "sap_id" not in names:
+            conn.execute(text("ALTER TABLE suppliers ADD COLUMN sap_id VARCHAR"))
+        if "dataverse_id" not in names:
+            conn.execute(text("ALTER TABLE suppliers ADD COLUMN dataverse_id VARCHAR"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_suppliers_sap_id ON suppliers (sap_id)"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_suppliers_dataverse_id ON suppliers (dataverse_id)"))
+
+
 @app.on_event("startup")
 def startup() -> None:
     models.Base.metadata.create_all(bind=engine)
+    _ensure_supplier_external_columns()
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     with SessionLocal() as db:
         seed.seed_if_empty(db)
@@ -88,6 +116,140 @@ def startup() -> None:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/sap/health")
+async def sap_health(validate: bool = False):
+    if validate:
+        await sap.check_connection()
+    return {"status": "ok", "validate": validate}
+
+
+@app.get("/azure-search/health")
+async def azure_search_health(validate: bool = False):
+    if validate:
+        await azure_search.health_check()
+    return {"status": "ok", "validate": validate}
+
+
+@app.post("/azure-search/contracts", response_model=schemas.AzureSearchResponse)
+async def azure_search_contracts(
+    query: str = Query(..., min_length=1),
+    top: int = Query(default=5, ge=1, le=50),
+):
+    items = await azure_search.search(query=query, top=top)
+    results = []
+    for item in items:
+        results.append(
+            schemas.AzureSearchResult(
+                id=item.get("id") or item.get("Id") or item.get("docId"),
+                title=item.get("title") or item.get("contractTitle"),
+                supplier=item.get("supplier") or item.get("supplierName"),
+                clauseType=item.get("clauseType") or item.get("clause_type"),
+                excerpt=item.get("excerpt") or item.get("text") or item.get("content"),
+                relevanceScore=item.get("@search.score"),
+                raw=item,
+            )
+        )
+    return schemas.AzureSearchResponse(results=results)
+
+
+@app.post("/sap/suppliers/pull", response_model=List[schemas.SapSupplierPreview])
+async def sap_pull_suppliers(
+    top: int = Query(default=50, ge=1, le=500),
+    skip: int = Query(default=0, ge=0),
+):
+    items = await sap.fetch_business_partners(top=top, skip=skip)
+    return [schemas.SapSupplierPreview(**sap.map_bp_to_supplier(bp)) for bp in items]
+
+
+@app.post("/sap/suppliers/sync", response_model=schemas.SapSyncResult)
+async def sap_sync_suppliers(
+    top: int = Query(default=200, ge=1, le=500),
+    skip: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    items = await sap.fetch_business_partners(top=top, skip=skip)
+    created = updated = skipped = 0
+    for bp in items:
+        mapped = sap.map_bp_to_supplier(bp)
+        sap_id = mapped.get("sap_id")
+        if not sap_id:
+            skipped += 1
+            continue
+        supplier = db.query(models.Supplier).filter_by(sap_id=sap_id).first()
+        if supplier:
+            supplier.name = mapped["name"]
+            supplier.country = mapped["country"]
+            supplier.category = mapped["category"]
+            supplier.status = mapped["status"]
+            supplier.risk_score = mapped["risk_score"]
+            supplier.risk_level = mapped["risk_level"]
+            updated += 1
+        else:
+            db.add(models.Supplier(**mapped))
+            created += 1
+    db.commit()
+    return schemas.SapSyncResult(total=len(items), created=created, updated=updated, skipped=skipped)
+
+
+@app.get("/dataverse/health")
+async def dataverse_health(validate: bool = False):
+    if validate:
+        await dataverse.check_connection()
+    return {"status": "ok", "validate": validate}
+
+
+@app.post("/dataverse/suppliers/pull", response_model=List[schemas.DataverseSupplierPreview])
+async def dataverse_pull_suppliers(
+    top: int = Query(default=50, ge=1, le=500),
+    skip: int = Query(default=0, ge=0),
+):
+    items = await dataverse.fetch_suppliers(top=top, skip=skip)
+    return [schemas.DataverseSupplierPreview(**dataverse.map_to_supplier(item)) for item in items]
+
+
+@app.post("/dataverse/suppliers/sync", response_model=schemas.DataverseSyncResult)
+async def dataverse_sync_suppliers(
+    top: int = Query(default=200, ge=1, le=500),
+    skip: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    items = await dataverse.fetch_suppliers(top=top, skip=skip)
+    created = updated = skipped = 0
+    for item in items:
+        mapped = dataverse.map_to_supplier(item)
+        dataverse_id = mapped.get("dataverse_id")
+        if not dataverse_id:
+            skipped += 1
+            continue
+        supplier = db.query(models.Supplier).filter_by(dataverse_id=dataverse_id).first()
+        if supplier:
+            supplier.name = mapped["name"]
+            supplier.country = mapped["country"]
+            supplier.category = mapped["category"]
+            supplier.status = mapped["status"]
+            supplier.risk_score = mapped["risk_score"]
+            supplier.risk_level = mapped["risk_level"]
+            updated += 1
+        else:
+            db.add(models.Supplier(**mapped))
+            created += 1
+    db.commit()
+    return schemas.DataverseSyncResult(total=len(items), created=created, updated=updated, skipped=skipped)
+
+
+@app.get("/power-platform/health")
+async def power_platform_health(validate: bool = False):
+    if validate:
+        await power_platform.validate_connection()
+    return {"status": "ok", "validate": validate}
+
+
+@app.post("/power-platform/flows/trigger", response_model=schemas.PowerAutomateResponse)
+async def power_platform_trigger(payload: Dict[str, Any]):
+    raw = await power_platform.trigger_flow(payload)
+    return schemas.PowerAutomateResponse(status="ok", raw=raw)
 
 
 @app.get("/")
@@ -183,6 +345,8 @@ def list_suppliers(
     return [
         schemas.SupplierOut(
             id=s.id,
+            sap_id=s.sap_id,
+            dataverse_id=s.dataverse_id,
             name=s.name,
             country=s.country,
             category=s.category,
@@ -201,7 +365,13 @@ def create_supplier(payload: schemas.SupplierCreate, db: Session = Depends(get_d
     db.add(supplier)
     db.commit()
     db.refresh(supplier)
-    return schemas.SupplierOut(**payload.model_dump(), id=supplier.id, contract_count=0)
+    return schemas.SupplierOut(
+        **payload.model_dump(),
+        id=supplier.id,
+        sap_id=supplier.sap_id,
+        dataverse_id=supplier.dataverse_id,
+        contract_count=0,
+    )
 
 
 @app.get("/suppliers/{supplier_id}", response_model=schemas.SupplierOut)
@@ -212,6 +382,8 @@ def get_supplier(supplier_id: int, db: Session = Depends(get_db)):
     contract_count = db.query(models.Contract).filter_by(supplier_id=supplier_id).count()
     return schemas.SupplierOut(
         id=supplier.id,
+        sap_id=supplier.sap_id,
+        dataverse_id=supplier.dataverse_id,
         name=supplier.name,
         country=supplier.country,
         category=supplier.category,
@@ -234,6 +406,8 @@ def update_supplier(supplier_id: int, payload: schemas.SupplierUpdate, db: Sessi
     contract_count = db.query(models.Contract).filter_by(supplier_id=supplier_id).count()
     return schemas.SupplierOut(
         id=supplier.id,
+        sap_id=supplier.sap_id,
+        dataverse_id=supplier.dataverse_id,
         name=supplier.name,
         country=supplier.country,
         category=supplier.category,
@@ -393,9 +567,8 @@ async def upload_document(
     if not supplier:
         raise HTTPException(status_code=404, detail="Supplier not found.")
     safe_name = f"{int(datetime.utcnow().timestamp())}_{file.filename}"
-    stored_path = UPLOADS_DIR / safe_name
     content = await file.read()
-    stored_path.write_bytes(content)
+    stored_path = await storage.save_file(safe_name, content, file.content_type)
     doc = models.Document(
         supplier_id=supplier_id,
         filename=file.filename,
@@ -423,41 +596,45 @@ async def validate_document(doc_id: int, db: Session = Depends(get_db)):
     doc = db.query(models.Document).filter_by(id=doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
+    if not doc.stored_path:
+        raise HTTPException(status_code=400, detail="Document has no stored file.")
 
-    provider = _provider()
-    if provider == "mock":
-        analysis = ai.mock_document_analysis(doc)
-        doc.status = "validated"
+    content_type = mimetypes.guess_type(doc.filename)[0] or "application/octet-stream"
+    file_bytes = await storage.read_file(doc.stored_path)
+    text = await document_processing.extract_text(file_bytes, content_type)
+    if not text.strip():
+        doc.status = "validation_failed"
         db.commit()
-        return analysis
+        return schemas.DocumentAnalysisResponse(
+            summary="No readable text extracted from document.",
+            key_fields=[],
+            issues=["No text extracted. Verify document quality and format."],
+            recommendation="Re-upload a clearer document or verify the file format.",
+            raw_text="",
+        )
+    entities, key_phrases = await document_processing.extract_entities(text)
 
-    try:
-        if provider == "anthropic":
-            text = await ai.call_anthropic(
-                system="You are a procurement document validation assistant. Provide JSON with summary, key_fields, issues, recommendation.",
-                user_content=f"Document: {doc.filename}\nType: {doc.doc_type}\nStatus: {doc.status}\nDate: {doc.created_at}",
-                max_tokens=600,
-            )
-        else:
-            text = await ai.call_groq(
-                system="You are a procurement document validation assistant. Provide JSON with summary, key_fields, issues, recommendation.",
-                user_content=f"Document: {doc.filename}\nType: {doc.doc_type}\nStatus: {doc.status}\nDate: {doc.created_at}",
-                max_tokens=600,
-            )
-        payload = ai.parse_json_payload(text)
-    except ai.LLMConfigError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail="AI validation failed.") from exc
+    key_fields = document_processing.build_key_fields(entities)
+    issues: List[str] = []
 
-    doc.status = "validated"
+    supplier = doc.supplier
+    if supplier:
+        contract_titles = [c.title for c in supplier.contracts]
+        issues.extend(document_processing.cross_reference(text, supplier.name, contract_titles))
+
+    issues.extend(document_processing.compliance_checks(doc.doc_type, text, entities, key_phrases))
+    summary = document_processing.summarize(text, key_phrases)
+    recommendation = "Proceed with validation and archive." if not issues else "Review flagged issues before approval."
+
+    doc.status = "validated" if not issues else "validation_failed"
     db.commit()
+
     return schemas.DocumentAnalysisResponse(
-        summary=payload.get("summary", ""),
-        key_fields=payload.get("key_fields", []),
-        issues=payload.get("issues", []),
-        recommendation=payload.get("recommendation", ""),
-        raw_text=text,
+        summary=summary,
+        key_fields=key_fields,
+        issues=issues,
+        recommendation=recommendation,
+        raw_text=document_processing.trim_text(text),
     )
 
 

@@ -28,6 +28,8 @@ class SupplierUpdate(BaseModel):
 
 class SupplierOut(SupplierBase):
     id: int
+    sap_id: Optional[str] = None
+    dataverse_id: Optional[str] = None
     contract_count: int = 0
     model_config = ConfigDict(from_attributes=True)
 
@@ -117,6 +119,55 @@ class KpiResponse(BaseModel):
     contracts: KpiContracts
     documents: KpiDocuments
     risk: KpiRisk
+
+
+class SapSupplierPreview(BaseModel):
+    sap_id: Optional[str] = None
+    name: str
+    country: str
+    category: str
+    status: str
+
+
+class SapSyncResult(BaseModel):
+    total: int
+    created: int
+    updated: int
+    skipped: int
+
+
+class DataverseSupplierPreview(BaseModel):
+    dataverse_id: Optional[str] = None
+    name: str
+    country: str
+    category: str
+    status: str
+
+
+class DataverseSyncResult(BaseModel):
+    total: int
+    created: int
+    updated: int
+    skipped: int
+
+
+class AzureSearchResult(BaseModel):
+    id: Optional[str] = None
+    title: Optional[str] = None
+    supplier: Optional[str] = None
+    clauseType: Optional[str] = None
+    excerpt: Optional[str] = None
+    relevanceScore: Optional[float] = None
+    raw: Optional[dict] = None
+
+
+class AzureSearchResponse(BaseModel):
+    results: List[AzureSearchResult]
+
+
+class PowerAutomateResponse(BaseModel):
+    status: str
+    raw: Optional[dict] = None
 
 
 class ContractSearchRequest(BaseModel):
