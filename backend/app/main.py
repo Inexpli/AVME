@@ -1,3 +1,4 @@
+import json
 import mimetypes
 import os
 from datetime import date, datetime, timedelta
@@ -7,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, Request
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
@@ -17,12 +18,14 @@ from . import (
     azure_search,
     dataverse,
     document_processing,
+    geopolitics,
     models,
     power_platform,
     sap,
     schemas,
     seed,
     storage,
+    validation,
 )
 from .database import SessionLocal, engine
 
@@ -74,7 +77,6 @@ def get_db():
 
 
 def _provider() -> str:
-    print("DEBUG ENV:", os.getenv("LLM_PROVIDER"), os.getenv("GROQ_API_KEY"))
     provider = os.getenv("LLM_PROVIDER")
     if provider:
         provider = provider.lower()
@@ -88,6 +90,37 @@ def _provider() -> str:
     if provider not in {"mock", "anthropic", "groq"}:
         raise HTTPException(status_code=503, detail="Unsupported LLM_PROVIDER.")
     return provider
+
+
+def _score_to_level(score: int) -> str:
+    if score >= 80:
+        return "low"
+    if score >= 60:
+        return "medium"
+    if score >= 40:
+        return "high"
+    return "critical"
+
+
+def _json_list(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return [str(v) for v in parsed]
+    except json.JSONDecodeError:
+        pass
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _to_json_list(values: List[str]) -> str:
+    return json.dumps(values)
+
+
+def _default_required_docs() -> List[str]:
+    raw = os.getenv("ONBOARDING_REQUIRED_DOCS", "registration,certification,contract")
+    return [v.strip() for v in raw.split(",") if v.strip()]
 
 
 def _ensure_supplier_external_columns() -> None:
@@ -152,6 +185,36 @@ async def azure_search_contracts(
             )
         )
     return schemas.AzureSearchResponse(results=results)
+
+
+@app.post("/azure-search/contracts/index")
+async def azure_search_index_contracts(
+    db: Session = Depends(get_db),
+):
+    id_field = os.getenv("AZURE_SEARCH_CONTRACT_ID_FIELD", "id")
+    title_field = os.getenv("AZURE_SEARCH_CONTRACT_TITLE_FIELD", "contractTitle")
+    supplier_field = os.getenv("AZURE_SEARCH_CONTRACT_SUPPLIER_FIELD", "supplier")
+    content_field = os.getenv("AZURE_SEARCH_CONTRACT_CONTENT_FIELD", "content")
+
+    contracts = db.query(models.Contract).all()
+    documents = []
+    for contract in contracts:
+        supplier_name = contract.supplier.name if contract.supplier else ""
+        content = f"{contract.title} {supplier_name} {contract.status} {contract.currency} {contract.total_value}"
+        documents.append(
+            {
+                id_field: f"contract-{contract.id}",
+                title_field: contract.title,
+                supplier_field: supplier_name,
+                content_field: content,
+                "status": contract.status,
+                "expiry_date": contract.expiry_date.isoformat(),
+                "total_value": contract.total_value,
+                "currency": contract.currency,
+            }
+        )
+    result = await azure_search.index_documents(documents)
+    return {"status": "ok", "indexed": len(documents), "result": result}
 
 
 @app.post("/sap/suppliers/pull", response_model=List[schemas.SapSupplierPreview])
@@ -418,6 +481,99 @@ def update_supplier(supplier_id: int, payload: schemas.SupplierUpdate, db: Sessi
     )
 
 
+def _onboarding_to_schema(record: models.SupplierOnboarding) -> schemas.OnboardingOut:
+    return schemas.OnboardingOut(
+        id=record.id,
+        supplier_id=record.supplier_id,
+        status=record.status,
+        contact_email=record.contact_email,
+        contact_name=record.contact_name,
+        required_docs=_json_list(record.required_docs),
+        submitted_docs=_json_list(record.submitted_docs),
+        notes=record.notes,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+@app.get("/onboarding", response_model=List[schemas.OnboardingOut])
+def list_onboarding(db: Session = Depends(get_db)):
+    records = db.query(models.SupplierOnboarding).order_by(models.SupplierOnboarding.created_at.desc()).all()
+    return [_onboarding_to_schema(r) for r in records]
+
+
+@app.post("/onboarding/start", response_model=schemas.OnboardingOut, status_code=201)
+def start_onboarding(payload: schemas.OnboardingStartRequest, db: Session = Depends(get_db)):
+    supplier = models.Supplier(
+        name=payload.name,
+        country=payload.country,
+        category=payload.category,
+        status="pending_validation",
+        risk_score=50,
+        risk_level="medium",
+    )
+    db.add(supplier)
+    db.commit()
+    db.refresh(supplier)
+
+    required_docs = payload.required_docs or _default_required_docs()
+    record = models.SupplierOnboarding(
+        supplier_id=supplier.id,
+        status="pending_documents",
+        contact_email=payload.contact_email,
+        contact_name=payload.contact_name,
+        required_docs=_to_json_list(required_docs),
+        submitted_docs=_to_json_list([]),
+        created_at=date.today(),
+        updated_at=date.today(),
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return _onboarding_to_schema(record)
+
+
+@app.post("/onboarding/{onboarding_id}/submit-doc", response_model=schemas.OnboardingOut)
+def submit_onboarding_doc(onboarding_id: int, payload: schemas.OnboardingSubmitDocRequest, db: Session = Depends(get_db)):
+    record = db.query(models.SupplierOnboarding).filter_by(id=onboarding_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Onboarding record not found.")
+    submitted = set(_json_list(record.submitted_docs))
+    submitted.add(payload.doc_type)
+    record.submitted_docs = _to_json_list(sorted(submitted))
+    required = set(_json_list(record.required_docs))
+    if required and required.issubset(submitted):
+        record.status = "under_review"
+    record.updated_at = date.today()
+    db.commit()
+    db.refresh(record)
+    return _onboarding_to_schema(record)
+
+
+@app.post("/onboarding/{onboarding_id}/review", response_model=schemas.OnboardingOut)
+def review_onboarding(onboarding_id: int, payload: schemas.OnboardingReviewRequest, db: Session = Depends(get_db)):
+    record = db.query(models.SupplierOnboarding).filter_by(id=onboarding_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Onboarding record not found.")
+    supplier = db.query(models.Supplier).filter_by(id=record.supplier_id).first()
+    decision = payload.decision.lower()
+    if decision not in {"approve", "reject"}:
+        raise HTTPException(status_code=400, detail="Decision must be approve or reject.")
+    record.notes = payload.notes
+    record.updated_at = date.today()
+    if decision == "approve":
+        record.status = "approved"
+        if supplier:
+            supplier.status = "active"
+    else:
+        record.status = "rejected"
+        if supplier:
+            supplier.status = "suspended"
+    db.commit()
+    db.refresh(record)
+    return _onboarding_to_schema(record)
+
+
 @app.get("/contracts", response_model=List[schemas.ContractOut])
 def list_contracts(
     status: Optional[str] = Query(default=None),
@@ -638,6 +794,37 @@ async def validate_document(doc_id: int, db: Session = Depends(get_db)):
     )
 
 
+@app.post("/validation/run", response_model=schemas.ValidationRunResult)
+def run_validation(apply: bool = Query(default=False), db: Session = Depends(get_db)):
+    issues: List[schemas.ValidationIssue] = []
+    suppliers = db.query(models.Supplier).all()
+    contracts = db.query(models.Contract).all()
+    documents = db.query(models.Document).all()
+
+    for supplier in suppliers:
+        supplier_issues = validation.validate_supplier(supplier)
+        issues.extend(supplier_issues)
+        if apply and supplier_issues:
+            supplier.status = "pending_validation"
+
+    for contract in contracts:
+        contract_issues = validation.validate_contract(contract)
+        issues.extend(contract_issues)
+        if apply and contract_issues:
+            contract.status = "draft"
+
+    for doc in documents:
+        doc_issues = validation.validate_document(doc)
+        issues.extend(doc_issues)
+        if apply and doc_issues:
+            doc.status = "validation_failed"
+
+    if apply:
+        db.commit()
+
+    return schemas.ValidationRunResult(total=len(issues), issues=issues)
+
+
 @app.post("/risk/assess", response_model=schemas.RiskAssessmentResponse)
 async def assess_risk(payload: schemas.RiskAssessmentRequest, db: Session = Depends(get_db)):
     supplier = db.query(models.Supplier).filter_by(id=payload.supplier_id).first()
@@ -645,8 +832,24 @@ async def assess_risk(payload: schemas.RiskAssessmentRequest, db: Session = Depe
         raise HTTPException(status_code=404, detail="Supplier not found.")
 
     provider = _provider()
+    geo = await geopolitics.score(supplier.country)
+    geo_factor = {
+        "name": "Geopolitical exposure",
+        "detail": geo.get("detail") or f"Country risk baseline for {supplier.country}.",
+        "impact": geo.get("level", "medium"),
+    }
+
     if provider == "mock":
-        return ai.mock_risk_assessment(supplier)
+        base = ai.mock_risk_assessment(supplier)
+        score = round((base.score + int(geo.get("score", 60))) / 2)
+        level = _score_to_level(score)
+        factors = [*base.factors, schemas.RiskFactor(**geo_factor)]
+        return schemas.RiskAssessmentResponse(
+            score=score,
+            level=level,
+            factors=factors,
+            recommendations=base.recommendations,
+        )
 
     try:
         if provider == "anthropic":
@@ -674,13 +877,41 @@ async def assess_risk(payload: schemas.RiskAssessmentRequest, db: Session = Depe
                     f"Active contracts: {len(supplier.contracts)}"
                 ),
                 max_tokens=800,
+                temperature=0.2,
             )
-        payload = ai.parse_json_payload(text)
-        return schemas.RiskAssessmentResponse(**payload)
+        payload_data = ai.parse_json_payload(text)
+        base_score = int(payload_data.get("score", supplier.risk_score))
+        score = round((base_score + int(geo.get("score", 60))) / 2)
+        level = payload_data.get("level") or _score_to_level(score)
+        factors = [schemas.RiskFactor(**f) for f in payload_data.get("factors", [])]
+        factors.append(schemas.RiskFactor(**geo_factor))
+        recommendations = payload_data.get("recommendations", [])
+        return schemas.RiskAssessmentResponse(score=score, level=level, factors=factors, recommendations=recommendations)
     except ai.LLMConfigError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail="AI risk assessment failed.") from exc
+    except Exception:
+        base_score = supplier.risk_score
+        score = round((base_score + int(geo.get("score", 60))) / 2)
+        level = _score_to_level(score)
+        factors = [
+            schemas.RiskFactor(
+                name="Financial stability",
+                detail=f"Baseline score from supplier profile ({supplier.risk_score}).",
+                impact="medium",
+            ),
+            schemas.RiskFactor(
+                name="Compliance posture",
+                detail=f"Supplier status is '{supplier.status}'.",
+                impact="high" if supplier.status != "active" else "low",
+            ),
+            schemas.RiskFactor(**geo_factor),
+        ]
+        recommendations = [
+            "AI model unavailable; used baseline scoring.",
+            "Schedule quarterly compliance reviews and refresh certifications.",
+            "Maintain dual-source coverage for critical SKUs.",
+        ]
+        return schemas.RiskAssessmentResponse(score=score, level=level, factors=factors, recommendations=recommendations)
 
 
 @app.post("/negotiation/draft", response_model=schemas.NegotiationDraftResponse)
@@ -723,9 +954,41 @@ async def draft_email(payload: schemas.NegotiationDraftRequest, db: Session = De
     except ai.LLMConfigError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=502, detail="AI email drafting failed.") from exc
+
+
+@app.post("/negotiation/stream")
+async def stream_email(payload: schemas.NegotiationDraftRequest, db: Session = Depends(get_db)):
+    supplier = db.query(models.Supplier).filter_by(id=payload.supplier_id).first()
+    if not supplier:
+        raise HTTPException(status_code=404, detail="Supplier not found.")
+
+    provider = _provider()
+    if provider == "mock":
+        email = ai.mock_negotiation_email(supplier, payload.scenario, payload.context or "")
+        return StreamingResponse(iter([email]), media_type="text/plain")
+
+    try:
+        def _gen():
+            for chunk in ai.stream_groq(
+                system="Draft a professional procurement negotiation email. Include a subject line.",
+                user_content=(
+                    f"Supplier: {supplier.name} ({supplier.country})\n"
+                    f"Scenario: {payload.scenario}\n"
+                    f"Context: {payload.context or 'Standard negotiation context.'}\n"
+                    f"Risk level: {supplier.risk_level}\n"
+                    f"Category: {supplier.category}"
+                ),
+                max_tokens=900,
+                temperature=0.7,
+            ):
+                yield chunk
+
+        return StreamingResponse(_gen(), media_type="text/plain")
+    except ai.LLMConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="AI streaming draft failed.") from exc
 
 
 @app.post("/contracts/search", response_model=schemas.ContractSearchResponse)

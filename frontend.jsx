@@ -128,6 +128,16 @@ async function apiFetch(path, options = {}) {
   return res.json();
 }
 
+async function apiStream(path, options = {}) {
+  const token = await getAccessToken();
+  const hasBody = options.body && !(options.body instanceof FormData);
+  const authHeader = token ? { Authorization: `Bearer ${token}` } : {};
+  const headers = hasBody
+    ? { "Content-Type": "application/json", ...authHeader, ...options.headers }
+    : { ...authHeader, ...options.headers };
+  return fetch(`${API_BASE}${path}`, { ...options, headers });
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const riskColor = (l) => ({ low: "#1D9E75", medium: "#BA7517", high: "#D85A30", critical: "#E24B4A" }[l] || "#888");
 const statusColor = (s) => ({
@@ -1184,7 +1194,7 @@ function Negotiation() {
     setStreaming(true);
     setError("");
     try {
-      const data = await apiFetch("/negotiation/draft", {
+      const res = await apiStream("/negotiation/stream", {
         method: "POST",
         body: JSON.stringify({
           supplier_id: supplier?.id,
@@ -1192,9 +1202,35 @@ function Negotiation() {
           context,
         }),
       });
-      setEmail(data.email);
+      if (!res.ok || !res.body) {
+        const text = await res.text();
+        throw new Error(text || `Request failed (${res.status})`);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let done = false;
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        if (value) {
+          const chunk = decoder.decode(value, { stream: true });
+          setEmail(prev => prev + chunk);
+        }
+      }
     } catch (err) {
-      setError(err.message || "Drafting failed.");
+      try {
+        const data = await apiFetch("/negotiation/draft", {
+          method: "POST",
+          body: JSON.stringify({
+            supplier_id: supplier?.id,
+            scenario,
+            context,
+          }),
+        });
+        setEmail(data.email);
+      } catch (fallbackErr) {
+        setError(fallbackErr.message || err.message || "Drafting failed.");
+      }
     } finally {
       setStreaming(false);
     }

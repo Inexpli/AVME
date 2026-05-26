@@ -51,3 +51,20 @@ class Document(Base):
 
     supplier = relationship("Supplier", back_populates="documents")
 
+
+class SupplierOnboarding(Base):
+    __tablename__ = "supplier_onboarding"
+
+    id = Column(Integer, primary_key=True, index=True)
+    supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=False)
+    status = Column(String, nullable=False, default="pending_documents")
+    contact_email = Column(String, nullable=True)
+    contact_name = Column(String, nullable=True)
+    required_docs = Column(String, nullable=True)
+    submitted_docs = Column(String, nullable=True)
+    notes = Column(String, nullable=True)
+    created_at = Column(Date, nullable=False, default=date.today)
+    updated_at = Column(Date, nullable=False, default=date.today)
+
+    supplier = relationship("Supplier")
+

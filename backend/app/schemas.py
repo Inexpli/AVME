@@ -220,3 +220,47 @@ class DocumentAnalysisResponse(BaseModel):
     recommendation: str
     raw_text: Optional[str] = None
 
+
+class ValidationIssue(BaseModel):
+    entity: str
+    entity_id: int
+    field: str
+    message: str
+    severity: str = "warning"
+
+
+class ValidationRunResult(BaseModel):
+    total: int
+    issues: List[ValidationIssue]
+
+
+class OnboardingStartRequest(BaseModel):
+    name: str
+    country: str
+    category: str
+    contact_email: Optional[str] = None
+    contact_name: Optional[str] = None
+    required_docs: Optional[List[str]] = None
+
+
+class OnboardingSubmitDocRequest(BaseModel):
+    doc_type: str
+
+
+class OnboardingReviewRequest(BaseModel):
+    decision: str
+    notes: Optional[str] = None
+
+
+class OnboardingOut(BaseModel):
+    id: int
+    supplier_id: int
+    status: str
+    contact_email: Optional[str] = None
+    contact_name: Optional[str] = None
+    required_docs: List[str] = []
+    submitted_docs: List[str] = []
+    notes: Optional[str] = None
+    created_at: date
+    updated_at: date
+

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 from datetime import date
@@ -176,7 +177,44 @@ async def call_groq(
     return await anyio.to_thread.run_sync(_call)
 
 
+def stream_groq(
+    system: str,
+    user_content: str,
+    max_tokens: int = 900,
+    temperature: float = 0.7,
+    top_p: float = 1.0,
+    reasoning_effort: str = "medium",
+):
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user_content})
+
+    client = _get_groq_client()
+    completion = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        stream=True,
+        stop=None,
+    )
+    for chunk in completion:
+        delta = chunk.choices[0].delta
+        content = getattr(delta, "content", None)
+        if content:
+            yield content
+
+
 def parse_json_payload(text: str):
     cleaned = text.replace("```json", "").replace("```", "").strip()
-    return json.loads(cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"(\{.*\}|\[.*\])", cleaned, flags=re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(1))
 
