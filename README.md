@@ -8,6 +8,18 @@ This repository contains a full‑stack prototype for an AI‑assisted procureme
 - Document processing pipeline (upload → OCR → NLP → validation)
 - Integration stubs for SAP, Azure AI Search, Dataverse, and Power Platform
 
+## Business value (non‑technical overview)
+1. **Faster supplier onboarding**  
+   Standardizes supplier intake with clear steps and required documentation, reducing back‑and‑forth and onboarding time.
+2. **Lower compliance risk**  
+   Automates document checks and flags missing or inconsistent data before it becomes a costly issue.
+3. **Better negotiations**  
+   Generates consistent, professional negotiation drafts so procurement teams can respond faster and keep leverage.
+4. **Visibility across contracts**  
+   Centralizes contract data and makes it searchable, improving decision‑making and audit readiness.
+5. **Operational efficiency**  
+   Reduces manual data entry and validation workload through automated checks and integrations.
+
 ## Project overview
 AVME is a prototype of an autonomous vendor management platform that streamlines the procurement lifecycle: onboarding suppliers, validating documentation, monitoring compliance, and accelerating negotiation workflows with AI assistance. The backend consolidates supplier, contract, and document data into a single API, while the frontend provides a role‑friendly dashboard for procurement teams.
 
