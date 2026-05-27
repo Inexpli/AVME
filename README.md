@@ -8,7 +8,7 @@ This repository contains a full‑stack prototype for an AI‑assisted procureme
 - Document processing pipeline (upload → OCR → NLP → validation)
 - Integration stubs for SAP, Azure AI Search, Dataverse, and Power Platform
 
-## Business value (non‑technical overview)
+## Business value
 1. **Faster supplier onboarding**  
    Standardizes supplier intake with clear steps and required documentation, reducing back‑and‑forth and onboarding time.
 2. **Lower compliance risk**  
@@ -22,6 +22,17 @@ This repository contains a full‑stack prototype for an AI‑assisted procureme
 
 ## Project overview
 AVME is a prototype of an autonomous vendor management platform that streamlines the procurement lifecycle: onboarding suppliers, validating documentation, monitoring compliance, and accelerating negotiation workflows with AI assistance. The backend consolidates supplier, contract, and document data into a single API, while the frontend provides a role‑friendly dashboard for procurement teams.
+
+<hr>
+
+<img width="1766" height="1271" alt="Dashboard" src="https://github.com/user-attachments/assets/0c1b8ba8-552e-4fbd-828b-551a3a26b5c2" />
+<img width="1766" height="1271" alt="Suppliers" src="https://github.com/user-attachments/assets/a1962d45-29df-4299-9a58-960ca2b7cd28" />
+<img width="1766" height="1271" alt="Contracts" src="https://github.com/user-attachments/assets/9cf55bae-86d8-4a00-9ebe-4b34071ec414" />
+<img width="1766" height="1271" alt="Documents" src="https://github.com/user-attachments/assets/b0ebb128-274b-4381-9195-e1b606f8ec5a" />
+<img width="1766" height="1271" alt="Risk Intel" src="https://github.com/user-attachments/assets/45932367-a51f-4d44-a67a-8b1b3cb116bf" />
+<img width="1768" height="1269" alt="Negotiation" src="https://github.com/user-attachments/assets/b21b237a-1498-42ff-ac0d-8b000daf5ad0" />
+
+<hr>
 
 The platform is designed to be integration‑first. Core flows (suppliers, contracts, documents) run locally, and external services (SAP, Dataverse, Azure AI Search, Azure Cognitive Services, Power Automate) can be connected by filling configuration in `.env`. This keeps the prototype productive for demos while staying ready for enterprise data sources.
 
